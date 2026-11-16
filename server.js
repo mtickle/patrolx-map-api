@@ -132,16 +132,55 @@ app.get('/api/active-incidents', requireApiKey, async (req, res) => {
 
 // 2. GET /api/cameras
 // 2. GET /api/cameras
+// 2. GET /api/cameras?minLat=...&maxLat=...&minLng=...&maxLng=...&lat=...&lng=...&limit=400
 app.get('/api/cameras', requireApiKey, async (req, res) => {
+  console.log('Fetching cameras with query:', req.query);
   try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 300, 600);
-    const query = `
-      SELECT id, name, latitude, longitude, image_url
-      FROM traffic_cameras
-      WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-      LIMIT $1
-    `;
-    const { rows } = await pool.query(query, [limit]);
+    const limit = Math.min(parseInt(req.query.limit, 10) || 400, 800);
+
+    // Default priority anchor: Wake County (Raleigh center)
+    const WAKE_LNG = -78.6382;
+    const WAKE_LAT = 35.7796;
+
+    const minLat = parseFloat(req.query.minLat);
+    const maxLat = parseFloat(req.query.maxLat);
+    const minLng = parseFloat(req.query.minLng);
+    const maxLng = parseFloat(req.query.maxLng);
+    const hasBounds = [minLat, maxLat, minLng, maxLng].every((v) => !Number.isNaN(v));
+
+    const centerLat = !Number.isNaN(parseFloat(req.query.lat)) ? parseFloat(req.query.lat) : WAKE_LAT;
+    const centerLng = !Number.isNaN(parseFloat(req.query.lng)) ? parseFloat(req.query.lng) : WAKE_LNG;
+
+    let query;
+    let params;
+
+    if (hasBounds) {
+      // Load cameras inside the active map viewport, ordered by proximity to viewport center
+      query = `
+        SELECT id, name, latitude, longitude, image_url
+        FROM traffic_cameras
+        WHERE geom IS NOT NULL
+          AND ST_Intersects(
+            geom,
+            ST_MakeEnvelope($1, $2, $3, $4, 4326)::geography
+          )
+        ORDER BY geom <-> ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography ASC
+        LIMIT $7
+      `;
+      params = [minLng, minLat, maxLng, maxLat, centerLng, centerLat, limit];
+    } else {
+      // Initial load fallback: prioritize Wake County cameras first
+      query = `
+        SELECT id, name, latitude, longitude, image_url
+        FROM traffic_cameras
+        WHERE geom IS NOT NULL
+        ORDER BY geom <-> ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography ASC
+        LIMIT $3
+      `;
+      params = [WAKE_LNG, WAKE_LAT, limit];
+    }
+
+    const { rows } = await pool.query(query, params);
 
     const protocol = req.headers['x-forwarded-proto'] || req.protocol;
     const baseUrl = `${protocol}://${req.get('host')}`;
