@@ -9,12 +9,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// PostgreSQL Pool (Workaround for Aiven self-signed certs included)
-const connectionString = (process.env.DATABASE_URL || '').replace(/\?sslmode=require$/, '');
+// PostgreSQL Pool (supports self-signed TLS certs in K3s and Aiven)
+const connectionString = (process.env.DATABASE_URL || '').replace(/\?sslmode=(require|no-verify)$/, '');
 const pool = new Pool({
   connectionString,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 5000
 });
+
+// Prevent idle socket drops (e.g., kubectl port-forward or pod restarts) from crashing Node
+pool.on('error', (err) => {
+  console.error('Unexpected idle PostgreSQL client error:', err.message);
+});
+
+const SEVERITY_RANK = { high: 3, medium: 2, low: 1 };
 
 // Middleware: Check x-api-key header
 const requireApiKey = (req, res, next) => {
@@ -76,10 +85,8 @@ function normalizeIncident(row) {
   };
 }
 
-const SEVERITY_RANK = { high: 3, medium: 2, low: 1 };
-
+// 1. GET /api/active-incidents?limit=150&sort=severity
 app.get('/api/active-incidents', requireApiKey, async (req, res) => {
-  console.log('Fetching active incidents with query:', req.query);
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 150, 400);
     const sortBy = req.query.sort || 'time';
@@ -116,65 +123,11 @@ app.get('/api/active-incidents', requireApiKey, async (req, res) => {
   }
 });
 
-// Health check for Render
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-// 1. GET /api/active-incidents?limit=150&county=Wake&sort=severity
-app.get('/api/active-incidents', requireApiKey, async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit, 10) || 150, 400);
-    const countyFilter = req.query.county;
-    // Inside /api/active-incidents handler:
-    const sortBy = req.query.sort || 'time'; // Default to newest first
-
-    const query = `
-      SELECT *
-      FROM unified_incidents
-      WHERE status = 'active'
-        AND timestamp >= NOW() - INTERVAL '2 hours'
-        AND latitude IS NOT NULL
-        AND longitude IS NOT NULL
-      ORDER BY timestamp DESC
-      LIMIT $1
-    `;
-    const { rows } = await pool.query(query, [limit]);
-
-    let incidents = rows
-      .map(normalizeIncident)
-      .filter((inc) => !Number.isNaN(inc.latitude) && !Number.isNaN(inc.longitude));
-
-    if (countyFilter && countyFilter.toLowerCase() !== 'all') {
-      incidents = incidents.filter(
-        (inc) => inc.county.toLowerCase() === countyFilter.toLowerCase()
-      );
-    }
-
-    // Sort order logic
-    if (sortBy === 'severity') {
-      incidents.sort((a, b) => {
-        if (b.severity_rank !== a.severity_rank) return b.severity_rank - a.severity_rank;
-        return new Date(b.timestamp) - new Date(a.timestamp);
-      });
-    } else {
-      // Default 'time' sorting: Newest first
-      incidents.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-    }
-
-    res.json(incidents);
-  } catch (err) {
-    console.error('Error fetching active incidents:', err);
-    res.status(500).json({ error: 'Database query failed' });
-  }
-});
-
+// 2. GET /api/cameras?lat=...&lng=...&limit=400
 app.get('/api/cameras', requireApiKey, async (req, res) => {
-
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 400, 800);
 
-    // Default priority anchor: Wake County (Raleigh center)
     const WAKE_LNG = -78.6382;
     const WAKE_LAT = 35.7796;
 
@@ -191,7 +144,6 @@ app.get('/api/cameras', requireApiKey, async (req, res) => {
     let params;
 
     if (hasBounds) {
-      // Load cameras inside the active map viewport, ordered by proximity to viewport center
       query = `
         SELECT id, name, latitude, longitude, image_url
         FROM traffic_cameras
@@ -205,7 +157,6 @@ app.get('/api/cameras', requireApiKey, async (req, res) => {
       `;
       params = [minLng, minLat, maxLng, maxLat, centerLng, centerLat, limit];
     } else {
-      // Initial load fallback: prioritize Wake County cameras first
       query = `
         SELECT id, name, latitude, longitude, image_url
         FROM traffic_cameras
@@ -218,16 +169,13 @@ app.get('/api/cameras', requireApiKey, async (req, res) => {
 
     const { rows } = await pool.query(query, params);
 
-    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-    const baseUrl = `${protocol}://${req.get('host')}`;
-
     const cameras = rows.map((cam) => ({
       id: cam.id,
       name: cam.name,
       latitude: Number(cam.latitude),
       longitude: Number(cam.longitude),
       image_url: cam.image_url,
-      proxy_url: `${baseUrl}/api/camera-proxy?url=${encodeURIComponent(cam.image_url)}`
+      proxy_url: `/api/camera-proxy?url=${encodeURIComponent(cam.image_url)}`
     }));
 
     res.json(cameras);
@@ -263,6 +211,11 @@ app.get('/api/camera-proxy', async (req, res) => {
     console.error('Camera proxy error:', err.message);
     res.status(502).send('Failed to fetch camera frame');
   }
+});
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3001;
