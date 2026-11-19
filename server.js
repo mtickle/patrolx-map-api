@@ -26,8 +26,6 @@ const requireApiKey = (req, res, next) => {
   next();
 };
 
-const SEVERITY_RANK = { high: 3, medium: 2, low: 1 };
-
 function normalizeIncident(row) {
   let details = row.details;
   if (typeof details === 'string') {
@@ -43,7 +41,7 @@ function normalizeIncident(row) {
     : '';
 
   const eventSubType = raw.EventSubType || raw.incidentType || row.event_type || 'Incident';
-  const rawDescription = raw.Description || raw.reason || row.problem_detail || '';
+  const rawDescription = raw.Description || raw.problem || raw.reason || row.problem_detail || '';
   const decoded = decodeNature(rawDescription) || decodeNature(eventSubType) || decodeNature(row.event_type);
   const displayNature = decoded || eventSubType;
 
@@ -60,7 +58,8 @@ function normalizeIncident(row) {
     source: row.source,
     source_id: row.source_id,
     status: row.status,
-    county: raw.County || raw.countyName || row.jurisdiction || 'Wake',
+    county: 'Wake',
+    jurisdiction: row.jurisdiction || raw.jurisdiction || raw.County || 'Wake County',
     title: `${roadway}${direction} - ${displayNature}`,
     roadway: `${roadway}${direction}`,
     event_type: eventSubType,
@@ -76,6 +75,46 @@ function normalizeIncident(row) {
     weather_forecast: row.weather_forecast ?? weather.shortForecast ?? null
   };
 }
+
+const SEVERITY_RANK = { high: 3, medium: 2, low: 1 };
+
+app.get('/api/active-incidents', requireApiKey, async (req, res) => {
+  console.log('Fetching active incidents with query:', req.query);
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 150, 400);
+    const sortBy = req.query.sort || 'time';
+
+    const query = `
+      SELECT *
+      FROM unified_incidents
+      WHERE status = 'active'
+        AND timestamp >= NOW() - INTERVAL '2 hours'
+        AND latitude IS NOT NULL
+        AND longitude IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT $1
+    `;
+    const { rows } = await pool.query(query, [limit]);
+
+    const incidents = rows
+      .map(normalizeIncident)
+      .filter((inc) => !Number.isNaN(inc.latitude) && !Number.isNaN(inc.longitude));
+
+    if (sortBy === 'severity') {
+      incidents.sort((a, b) => {
+        if (b.severity_rank !== a.severity_rank) return b.severity_rank - a.severity_rank;
+        return new Date(b.timestamp) - new Date(a.timestamp);
+      });
+    } else {
+      incidents.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    }
+
+    res.json(incidents);
+  } catch (err) {
+    console.error('Error fetching active incidents:', err);
+    res.status(500).json({ error: 'Database query failed' });
+  }
+});
 
 // Health check for Render
 app.get('/api/health', (req, res) => {
@@ -130,11 +169,8 @@ app.get('/api/active-incidents', requireApiKey, async (req, res) => {
   }
 });
 
-// 2. GET /api/cameras
-// 2. GET /api/cameras
-// 2. GET /api/cameras?minLat=...&maxLat=...&minLng=...&maxLng=...&lat=...&lng=...&limit=400
 app.get('/api/cameras', requireApiKey, async (req, res) => {
-  console.log('Fetching cameras with query:', req.query);
+
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 400, 800);
 
