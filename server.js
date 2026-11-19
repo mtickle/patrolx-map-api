@@ -18,7 +18,7 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000
 });
 
-// Prevent idle socket drops (e.g., kubectl port-forward or pod restarts) from crashing Node
+// Prevent idle socket drops from crashing Node
 pool.on('error', (err) => {
   console.error('Unexpected idle PostgreSQL client error:', err.message);
 });
@@ -123,7 +123,7 @@ app.get('/api/active-incidents', requireApiKey, async (req, res) => {
   }
 });
 
-// 2. GET /api/cameras?lat=...&lng=...&limit=400
+// 2. GET /api/cameras?limit=400 (Wake County only, ordered outward from Raleigh)
 app.get('/api/cameras', requireApiKey, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 400, 800);
@@ -131,43 +131,19 @@ app.get('/api/cameras', requireApiKey, async (req, res) => {
     const WAKE_LNG = -78.6382;
     const WAKE_LAT = 35.7796;
 
-    const minLat = parseFloat(req.query.minLat);
-    const maxLat = parseFloat(req.query.maxLat);
-    const minLng = parseFloat(req.query.minLng);
-    const maxLng = parseFloat(req.query.maxLng);
-    const hasBounds = [minLat, maxLat, minLng, maxLng].every((v) => !Number.isNaN(v));
+    const query = `
+      SELECT id, name, latitude, longitude, image_url
+      FROM traffic_cameras
+      WHERE geom IS NOT NULL
+        AND ST_Intersects(
+          geom,
+          ST_MakeEnvelope(-78.99, 35.51, -78.25, 36.08, 4326)::geography
+        )
+      ORDER BY geom <-> ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography ASC
+      LIMIT $3
+    `;
 
-    const centerLat = !Number.isNaN(parseFloat(req.query.lat)) ? parseFloat(req.query.lat) : WAKE_LAT;
-    const centerLng = !Number.isNaN(parseFloat(req.query.lng)) ? parseFloat(req.query.lng) : WAKE_LNG;
-
-    let query;
-    let params;
-
-    if (hasBounds) {
-      query = `
-        SELECT id, name, latitude, longitude, image_url
-        FROM traffic_cameras
-        WHERE geom IS NOT NULL
-          AND ST_Intersects(
-            geom,
-            ST_MakeEnvelope($1, $2, $3, $4, 4326)::geography
-          )
-        ORDER BY geom <-> ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography ASC
-        LIMIT $7
-      `;
-      params = [minLng, minLat, maxLng, maxLat, centerLng, centerLat, limit];
-    } else {
-      query = `
-        SELECT id, name, latitude, longitude, image_url
-        FROM traffic_cameras
-        WHERE geom IS NOT NULL
-        ORDER BY geom <-> ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography ASC
-        LIMIT $3
-      `;
-      params = [WAKE_LNG, WAKE_LAT, limit];
-    }
-
-    const { rows } = await pool.query(query, params);
+    const { rows } = await pool.query(query, [WAKE_LNG, WAKE_LAT, limit]);
 
     const cameras = rows.map((cam) => ({
       id: cam.id,
